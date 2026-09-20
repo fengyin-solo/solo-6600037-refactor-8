@@ -81,6 +81,8 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import { useOpticsStore } from './store/optics'
+import { wavelengthToRGB } from './render/color'
+import { createRenderPipeline, type DrawContext } from './render/pipeline'
 
 const store = useOpticsStore()
 const patternRef = ref<HTMLCanvasElement | null>(null)
@@ -93,28 +95,11 @@ const experiments = [
   { id: 'newton', name: '牛顿环干涉' },
 ]
 
-function wavelengthToRGB(nm: number): [number, number, number] {
-  let r = 0, g = 0, b = 0
-  if (nm >= 380 && nm < 440) { r = -(nm - 440) / 60; b = 1.0 }
-  else if (nm >= 440 && nm < 490) { g = (nm - 440) / 50; b = 1.0 }
-  else if (nm >= 490 && nm < 510) { g = 1.0; b = -(nm - 510) / 20 }
-  else if (nm >= 510 && nm < 580) { r = (nm - 510) / 70; g = 1.0 }
-  else if (nm >= 580 && nm < 645) { r = 1.0; g = -(nm - 645) / 65 }
-  else if (nm >= 645 && nm <= 780) { r = 1.0 }
-  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)]
-}
+// 以下三个函数只负责各自图层的专属画法；尺寸处理、清屏、降级由统一管线完成。
+// 数据数组与波长取自同一渲染快照（DrawContext），保证三个图层同版本。
 
-function drawPattern() {
-  const canvas = patternRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
-  ctx.fillStyle = 'black'
-  ctx.fillRect(0, 0, W, H)
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
-  const data = store.intensityData
+function drawPattern({ ctx, width: W, height: H, data, wavelength }: DrawContext) {
+  const [r, g, b] = wavelengthToRGB(wavelength)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
     const intensity = data[idx] || 0
@@ -124,17 +109,8 @@ function drawPattern() {
   }
 }
 
-function drawIntensity() {
-  const canvas = intensityRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
-  ctx.fillStyle = '#0f172a'
-  ctx.fillRect(0, 0, W, H)
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
-  const data = store.intensityData
+function drawIntensity({ ctx, width: W, height: H, data, wavelength }: DrawContext) {
+  const [r, g, b] = wavelengthToRGB(wavelength)
   ctx.beginPath()
   ctx.strokeStyle = `rgb(${r},${g},${b})`
   ctx.lineWidth = 2
@@ -156,15 +132,8 @@ function drawIntensity() {
   ctx.fillText('0', W / 2, H - 2); ctx.fillText('光强 I', 30, 12); ctx.fillText('位置 x', W - 20, H - 2)
 }
 
-function drawHeatmap() {
-  const canvas = heatmapRef.value
-  if (!canvas || !store.intensityData.length) return
-  canvas.width = canvas.clientWidth
-  canvas.height = 200
-  const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
-  const data = store.intensityData
+function drawHeatmap({ ctx, width: W, height: H, data, wavelength }: DrawContext) {
+  const [r, g, b] = wavelengthToRGB(wavelength)
   const imgData = ctx.createImageData(W, H)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
@@ -179,8 +148,26 @@ function drawHeatmap() {
   ctx.putImageData(imgData, 0, 0)
 }
 
-function renderAll() { drawPattern(); drawIntensity(); drawHeatmap() }
+// 三类实验的图层共用一条管线：同版本快照、统一尺寸处理、统一清屏与降级
+const pipeline = createRenderPipeline({
+  getSnapshot: () => ({
+    version: store.dataVersion,
+    wavelength: store.params.wavelength,
+    data: store.intensityData,
+    valid: store.dataValid,
+  }),
+  layers: [
+    { resolve: () => patternRef.value, background: 'black', draw: drawPattern },
+    { resolve: () => intensityRef.value, background: '#0f172a', draw: drawIntensity },
+    { resolve: () => heatmapRef.value, background: 'black', draw: drawHeatmap },
+  ],
+})
 
-onMounted(() => { store.compute(); setTimeout(renderAll, 100) })
-watch(() => store.intensityData, () => renderAll(), { deep: true })
+onMounted(() => {
+  store.compute()
+  // 首帧等待布局完成后按当前数据版本渲染（与旧版 setTimeout 等布局的意图一致）
+  requestAnimationFrame(() => requestAnimationFrame(pipeline.requestRender))
+})
+// 只监听版本号：一次计算/降级对应一次重绘，避免深比较大数组
+watch(() => store.dataVersion, () => pipeline.requestRender())
 </script>
